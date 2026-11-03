@@ -1,0 +1,123 @@
+# One platform's build: the desktop app and rembrandt-server. Called by release.yml.
+name: Build mirrored upstream revision
+permissions:
+  contents: read
+on:
+  workflow_call:
+    inputs:
+      source_ref: { type: string, required: true }
+      os: { type: string, required: true }
+      target: { type: string, required: true }
+      args: { type: string, required: true }
+      server: { type: string, required: true }
+      musl: { type: string, required: false, default: '' }
+
+jobs:
+  build:
+    runs-on: ${{ inputs.os }}
+    env:
+      HAS_WINDOWS_CERT: ${{ secrets.WINDOWS_CERTIFICATE != '' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.source_ref }}
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with: { node-version: 22 }
+      - uses: dtolnay/rust-toolchain@89b12181fb390509a0842a86cc55eeb8eb928c1d # stable
+        with:
+          targets: ${{ inputs.target }}${{ inputs.musl && format(',{0}', inputs.musl) || '' }}
+      - uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with: { workspaces: "src-tauri\nserver" }
+      - name: Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libayatana-appindicator3-dev librsvg2-dev libxdo-dev patchelf musl-tools
+      - run: npm ci
+      - run: npm run check
+      - name: Windows signing certificate
+        if: runner.os == 'Windows' && env.HAS_WINDOWS_CERT == 'true'
+        env:
+          WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+          WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+        shell: pwsh
+        run: |
+          [IO.File]::WriteAllBytes("cert.pfx", [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $cert = Import-PfxCertificate -FilePath cert.pfx -CertStoreLocation Cert:\CurrentUser\My -Password (ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -AsPlainText -Force)
+          Remove-Item cert.pfx
+          "WINDOWS_THUMBPRINT=$($cert.Thumbprint)" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: Build the desktop app
+        shell: bash
+        env:
+          LUMEN_CONFIG_JS: ${{ vars.LUMEN_CONFIG_JS }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          # Empty secrets must be unset, or the bundler tries to use a blank certificate.
+          for v in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID LUMEN_CONFIG_JS; do
+            [ -n "${!v:-}" ] || unset "$v"
+          done
+          sign=()
+          if [ -n "${WINDOWS_THUMBPRINT:-}" ]; then
+            sign=(--config "{\"bundle\":{\"windows\":{\"certificateThumbprint\":\"$WINDOWS_THUMBPRINT\",\"digestAlgorithm\":\"sha256\",\"timestampUrl\":\"http://timestamp.digicert.com\"}}}")
+          fi
+          # Without an Apple certificate, sign the Mac app ad hoc. A completely unsigned app that was
+          # downloaded is reported as "damaged" with no way to open it; an ad-hoc signed one gets the
+          # usual "Apple could not verify" prompt, which System Settings › Privacy & Security can allow.
+          if [ "$RUNNER_OS" = macOS ] && [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
+            sign=(--config '{"bundle":{"macOS":{"signingIdentity":"-"}}}')
+          fi
+          npx tauri build ${{ inputs.args }} "${sign[@]}"
+      - name: Check the Mac app's signature
+        if: runner.os == 'macOS'
+        shell: bash
+        # Checks the app inside the .dmg, which is what people download (the loose .app is removed
+        # once the .dmg is made).
+        run: |
+          dmg=$(ls src-tauri/target/${{ inputs.target }}/release/bundle/dmg/*.dmg | head -1)
+          mnt=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$mnt" "$dmg" >/dev/null
+          trap 'hdiutil detach "$mnt" -quiet || true' EXIT
+          app=$(ls -d "$mnt"/*.app | head -1)
+          codesign --verify --deep --strict --verbose=2 "$app"
+          codesign -dv "$app" 2>&1 | grep -E 'Identifier|Signature|TeamIdentifier|Authority' || true
+      - name: Build rembrandt-server
+        shell: bash
+        run: |
+          target='${{ inputs.musl || inputs.target }}'
+          cargo build --release --manifest-path server/Cargo.toml --target "$target"
+          mkdir -p pkg/web
+          cp -r dist/. pkg/web/
+          cp LICENSE NOTICE.md pkg/
+          if [ "$RUNNER_OS" = Windows ]; then
+            cp "server/target/$target/release/rembrandt-server.exe" pkg/
+          else
+            cp "server/target/$target/release/rembrandt-server" pkg/
+          fi
+      - name: Collect files
+        shell: bash
+        run: |
+          mkdir -p out
+          b='src-tauri/target/${{ inputs.target }}/release/bundle'
+          # Copy the first file matching a pattern, if this platform produced one.
+          pick() { for f in $1; do if [ -e "$f" ]; then cp "$f" "out/$2"; echo "$2"; fi; break; done; }
+          case '${{ inputs.server }}' in
+            macos-aarch64)   pick "$b/dmg/*.dmg" Rembrandt-macos-arm64.dmg ;;
+            macos-x86_64)    pick "$b/dmg/*.dmg" Rembrandt-macos-x64.dmg ;;
+            windows-x86_64)  pick "$b/nsis/*-setup.exe" Rembrandt-windows-x64-setup.exe; pick "$b/msi/*.msi" Rembrandt-windows-x64.msi ;;
+            windows-aarch64) pick "$b/nsis/*-setup.exe" Rembrandt-windows-arm64-setup.exe ;;
+            linux-x86_64)    pick "$b/appimage/*.AppImage" Rembrandt-linux-x86_64.AppImage; pick "$b/deb/*.deb" Rembrandt-linux-amd64.deb; pick "$b/rpm/*.rpm" Rembrandt-linux-x86_64.rpm ;;
+            linux-aarch64)   pick "$b/appimage/*.AppImage" Rembrandt-linux-aarch64.AppImage; pick "$b/deb/*.deb" Rembrandt-linux-arm64.deb; pick "$b/rpm/*.rpm" Rembrandt-linux-aarch64.rpm ;;
+          esac
+          s='rembrandt-server-${{ inputs.server }}'
+          if [ "$RUNNER_OS" = Windows ]; then (cd pkg && 7z a -tzip "../out/$s.zip" . >/dev/null); echo "$s.zip"
+          else tar -czf "out/$s.tar.gz" -C pkg .; echo "$s.tar.gz"; fi
+          ls -la out
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: rembrandt-${{ inputs.server }}
+          path: out/*
+          if-no-files-found: error
