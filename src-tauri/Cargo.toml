@@ -1,6 +1,6 @@
 [package]
 name = "lumen"
-version = "0.3.36"
+version = "0.3.37"
 description = "Rembrandt photo editor"
 authors = ["Rembrandt contributors"]
 license = "GPL-3.0-or-later"
@@ -24,7 +24,7 @@ tauri-plugin-deep-link = ">=2, <2.6.4"
 tauri-plugin-single-instance = { version = "2", features = ["deep-link"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-getrandom = "0.3"
+getrandom = "0.4"
 jpeg-decoder = "0.3"
 
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]
@@ -35,14 +35,14 @@ c2pa = { version = "=0.91.11", default-features = false, features = ["rust_nativ
 rcgen = { version = "0.14", default-features = false, features = ["ring", "pem", "crypto"] }
 # GPU benchmark (src/gpubench.rs): the editor's main colour stage on the native GPU API, to compare
 # with the web view's WebGL before building a native renderer.
-wgpu = "=30.0.1"
+wgpu = "=30.0.2"
 pollster = "1.0"
 
 # The system web view on Linux: its graphics acceleration is set explicitly (see lib.rs).
 # libloading: libgphoto2 for tethering, opened when tethering starts (src/tether/gphoto.rs).
 [target.'cfg(target_os = "linux")'.dependencies]
 webkit2gtk = "2.0"
-libloading = "0.8"
+libloading = "0.9"
 
 # Generative Remove natively (src/inpaint.rs): ONNX Runtime with Core ML, prebuilt for Apple silicon.
 # Elsewhere the web app's WebAssembly version (the prebuilt Linux library needs glibc 2.38 and a newer
